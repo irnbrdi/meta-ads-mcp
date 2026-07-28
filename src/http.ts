@@ -1,15 +1,5 @@
 #!/usr/bin/env node
 
-/**
- * HTTP entrypoint for remote MCP hosting (Railway, Langdock, etc.).
- *
- * The upstream project ships a STDIO transport (src/index.ts) which only works
- * for local clients like Claude Desktop. This file exposes the exact same tool
- * set over Streamable HTTP so a remote MCP client can reach it.
- *
- * No extra dependencies: uses the Node built-in http module.
- */
-
 import { createServer } from "node:http";
 import { createRequire } from "node:module";
 import { randomUUID } from "node:crypto";
@@ -18,7 +8,6 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { loadConfig } from "./config.js";
 import { AdsClient } from "./services/ads-client.js";
 
-// --- Tool imports ---
 import { registerCampaignTools } from "./tools/campaigns.js";
 import { registerAdsetTools } from "./tools/adsets.js";
 import { registerAdTools } from "./tools/ads.js";
@@ -42,8 +31,6 @@ import { registerAccountTools } from "./tools/account.js";
 import { registerBusinessTools } from "./tools/business.js";
 import { registerAuthTools } from "./tools/auth.js";
 import { registerAdLibraryTools } from "./tools/ad_library.js";
-
-// --- Resources & Prompts ---
 import { registerResources } from "./resources/account.js";
 import { registerPrompts } from "./prompts/index.js";
 
@@ -54,11 +41,9 @@ const PORT = Number(process.env.PORT) || 8000;
 const MCP_PATH = process.env.MCP_PATH || "/mcp";
 const AUTH_TOKEN = process.env.MCP_AUTH_TOKEN || "";
 
-/** Build a fully wired MCP server instance. */
 function buildServer(): McpServer {
   const server = new McpServer({ name: "meta-ads-mcp", version });
   const client = new AdsClient(loadConfig());
-
   registerCampaignTools(server, client);
   registerAdsetTools(server, client);
   registerAdTools(server, client);
@@ -84,11 +69,9 @@ function buildServer(): McpServer {
   registerAdLibraryTools(server, client);
   registerResources(server, client);
   registerPrompts(server);
-
   return server;
 }
 
-/** Read and parse a JSON request body. */
 function readJsonBody(req: import("node:http").IncomingMessage): Promise<unknown> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
@@ -97,26 +80,43 @@ function readJsonBody(req: import("node:http").IncomingMessage): Promise<unknown
     req.on("end", () => {
       const raw = Buffer.concat(chunks).toString("utf8");
       if (!raw) return resolve(undefined);
-      try {
-        resolve(JSON.parse(raw));
-      } catch (err) {
-        reject(err);
-      }
+      try { resolve(JSON.parse(raw)); } catch (err) { reject(err); }
     });
   });
 }
 
-/** Optional shared-secret check so the endpoint is not fully public. */
 function isAuthorized(req: import("node:http").IncomingMessage): boolean {
   if (!AUTH_TOKEN) return true;
   const header = req.headers.authorization || "";
-  return header === `Bearer ${AUTH_TOKEN}`;
+  return header === "Bearer " + AUTH_TOKEN;
+}
+
+// Session store
+const sessions = new Map<string, { server: McpServer; transport: StreamableHTTPServerTransport; lastUsed: number }>();
+
+async function getOrCreateSession(sessionId?: string): Promise<{ transport: StreamableHTTPServerTransport; server: McpServer; id: string }> {
+  if (sessionId && sessions.has(sessionId)) {
+    const s = sessions.get(sessionId)!;
+    s.lastUsed = Date.now();
+    return { transport: s.transport, server: s.server, id: sessionId };
+  }
+
+  const id = randomUUID();
+  const server = buildServer();
+  const transport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: () => id,
+    enableJsonResponse: true,
+  });
+
+  await server.connect(transport);
+  sessions.set(id, { server, transport, lastUsed: Date.now() });
+  transport.onclose = () => { sessions.delete(id); };
+  return { transport, server, id };
 }
 
 const httpServer = createServer(async (req, res) => {
-  const url = new URL(req.url || "/", `http://${req.headers.host}`);
+  const url = new URL(req.url || "/", "http://" + (req.headers.host || "localhost"));
 
-  // Health check for Railway
   if (url.pathname === "/health") {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ status: "ok", server: "meta-ads-mcp", version }));
@@ -135,38 +135,67 @@ const httpServer = createServer(async (req, res) => {
     return;
   }
 
-  // Stateless mode: a fresh server + transport per request keeps horizontal
-  // scaling on Railway simple and avoids cross-tenant session leaks.
-  const server = buildServer();
-  const transport = new StreamableHTTPServerTransport({
-    sessionIdGenerator: () => randomUUID(),
-    enableJsonResponse: true,
-  });
+  if (req.method === "DELETE") {
+    const sid = req.headers["mcp-session-id"] as string | undefined;
+    if (sid && sessions.has(sid)) {
+      const s = sessions.get(sid)!;
+      await s.transport.close();
+      await s.server.close();
+      sessions.delete(sid);
+    }
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ success: true }));
+    return;
+  }
 
-  res.on("close", () => {
-    void transport.close();
-    void server.close();
-  });
+  if (req.method === "GET") {
+    const sid = req.headers["mcp-session-id"] as string | undefined;
+    if (sid && sessions.has(sid)) {
+      await sessions.get(sid)!.transport.handleRequest(req, res);
+    } else {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "No valid session" }));
+    }
+    return;
+  }
+
+  if (req.method !== "POST") {
+    res.writeHead(405, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "Method not allowed" }));
+    return;
+  }
 
   try {
-    await server.connect(transport);
-    const body = req.method === "POST" ? await readJsonBody(req) : undefined;
-    await transport.handleRequest(req, res, body);
+    const body = await readJsonBody(req);
+    const sid = req.headers["mcp-session-id"] as string | undefined;
+    const session = await getOrCreateSession(sid);
+
+    res.on("close", () => {
+      // Keep session alive for reuse, cleanup handled by interval
+    });
+
+    await session.transport.handleRequest(req, res, body);
   } catch (err) {
     console.error("MCP request failed:", err);
     if (!res.headersSent) {
       res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(
-        JSON.stringify({
-          jsonrpc: "2.0",
-          error: { code: -32603, message: "Internal server error" },
-          id: null,
-        })
-      );
+      res.end(JSON.stringify({ jsonrpc: "2.0", error: { code: -32603, message: "Internal server error" }, id: null }));
     }
   }
 });
 
+// Clean up stale sessions every 5 minutes (idle > 30 min)
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, s] of sessions) {
+    if (now - s.lastUsed > 30 * 60 * 1000) {
+      void s.transport.close();
+      void s.server.close();
+      sessions.delete(id);
+    }
+  }
+}, 5 * 60 * 1000);
+
 httpServer.listen(PORT, "0.0.0.0", () => {
-  console.error(`meta-ads-mcp listening on 0.0.0.0:${PORT}${MCP_PATH}`);
+  console.error("meta-ads-mcp listening on 0.0.0.0:" + PORT + MCP_PATH);
 });
